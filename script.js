@@ -1,0 +1,1166 @@
+/**
+ * TrackFlow: Field Service Locator & Customer Tracker (Authentication & High-Accuracy GPS Version)
+ * Script logic for Leaflet map render, Supabase Auth integrations, RLS query scoping, and high-accuracy geolocation centering.
+ */
+
+// Global State Variables
+let supabaseClient = null;
+let map = null;
+let markers = [];              // Array of { id: number, marker: L.marker }
+let tempMarker = null;         // Active marker for logging a new customer location
+let selectedCoords = null;     // Active coordinates object: { lat: float, lng: float }
+let customersData = [];        // Cache of fetched customer records from database
+let sessionUser = null;        // Active authenticated Supabase user object
+let userWorkerName = '';       // Logged in worker's name
+let userLocationMarker = null; // High-accuracy GPS marker indicating worker position
+let authMode = 'login';        // State of auth card: 'login' | 'signup' | 'forgot-password' | 'reset-password'
+
+// DOM Elements
+const elements = {
+  // Navigation Tabs
+  tabLog: document.getElementById('tab-log'),
+  tabDatabase: document.getElementById('tab-database'),
+  panelForm: document.getElementById('panel-form'),
+  panelDatabase: document.getElementById('panel-database'),
+  customerCount: document.getElementById('customer-count'),
+
+  // Config & Modal Elements
+  btnSettings: document.getElementById('btn-settings'),
+  btnLogout: document.getElementById('btn-logout'),
+  settingsModal: document.getElementById('settings-modal'),
+  settingsForm: document.getElementById('settings-form'),
+  btnClearSettings: document.getElementById('btn-clear-settings'),
+  btnCloseSettings: document.getElementById('btn-close-settings'),
+  modalCloseOverlay: document.getElementById('modal-close-overlay'),
+  supabaseUrlInput: document.getElementById('settings-supabase-url'),
+  supabaseKeyInput: document.getElementById('settings-supabase-key'),
+  mapCredentialsOverlay: document.getElementById('map-credentials-overlay'),
+  btnSetupOverlay: document.getElementById('btn-setup-overlay'),
+
+  // Auth Overlay Elements
+  authOverlay: document.getElementById('auth-overlay'),
+  authNavTabs: document.getElementById('auth-nav-tabs'),
+  authTabLogin: document.getElementById('auth-tab-login'),
+  authTabSignup: document.getElementById('auth-tab-signup'),
+  authForm: document.getElementById('auth-form'),
+  authGroupEmail: document.getElementById('auth-group-email'),
+  authGroupWorkerName: document.getElementById('auth-group-worker-name'),
+  authGroupPassword: document.getElementById('auth-group-password'),
+  authGroupConfirmPassword: document.getElementById('auth-group-confirm-password'),
+  authPasswordLabel: document.getElementById('auth-password-label'),
+  authForgotPasswordLink: document.getElementById('auth-forgot-password-link'),
+  authConfirmPassword: document.getElementById('auth-confirm-password'),
+  authEmail: document.getElementById('auth-email'),
+  authWorkerName: document.getElementById('auth-worker-name'),
+  authPassword: document.getElementById('auth-password'),
+  btnAuthSubmit: document.getElementById('btn-auth-submit'),
+  authFooter: document.getElementById('auth-footer'),
+  authBackToLoginLink: document.getElementById('auth-back-to-login-link'),
+
+  // Form Elements
+  customerForm: document.getElementById('customer-form'),
+  coordsCard: document.getElementById('coords-card'),
+  valLatitude: document.getElementById('val-latitude'),
+  valLongitude: document.getElementById('val-longitude'),
+  inputName: document.getElementById('input-name'),
+  inputWorker: document.getElementById('input-worker'),
+  inputPhone: document.getElementById('input-phone'),
+  inputNotes: document.getElementById('input-notes'),
+  btnSave: document.getElementById('btn-save'),
+
+  // Search & List Elements
+  searchInput: document.getElementById('search-input'),
+  btnClearSearch: document.getElementById('btn-clear-search'),
+  customerList: document.getElementById('customer-list'),
+
+  // Map Controls
+  mapViewport: document.getElementById('map'),
+  btnMyLocation: document.getElementById('btn-my-location'),
+  toastContainer: document.getElementById('toast-container')
+};
+
+// ----------------------------------------------------
+// 1. Initialization and Auth Listeners
+// ----------------------------------------------------
+
+document.addEventListener('DOMContentLoaded', () => {
+  setupEventListeners();
+  loadSavedSettings();
+  
+  // Initialize Leaflet Map immediately so it displays OSM grids right away
+  initLeafletMap();
+  
+  // Connect to Supabase and handle auth states
+  initializeDatabaseConnection();
+});
+
+/**
+ * Setup Event Listeners for UI interaction
+ */
+function setupEventListeners() {
+  // Tab Switching (Touch and Click friendly)
+  elements.tabLog.addEventListener('click', () => switchTab('log'));
+  elements.tabDatabase.addEventListener('click', () => switchTab('database'));
+
+  // Settings Modal controls
+  elements.btnSettings.addEventListener('click', openSettingsModal);
+  elements.btnCloseSettings.addEventListener('click', closeSettingsModal);
+  elements.modalCloseOverlay.addEventListener('click', closeSettingsModal);
+  elements.btnSetupOverlay.addEventListener('click', openSettingsModal);
+  elements.settingsForm.addEventListener('submit', handleSettingsSave);
+  elements.btnClearSettings.addEventListener('click', handleSettingsClear);
+
+  // Authentication Panel listeners
+  elements.authTabLogin.addEventListener('click', () => switchAuthMode('login'));
+  elements.authTabSignup.addEventListener('click', () => switchAuthMode('signup'));
+  elements.authForgotPasswordLink.addEventListener('click', (e) => {
+    e.preventDefault();
+    switchAuthMode('forgot-password');
+  });
+  elements.authBackToLoginLink.addEventListener('click', (e) => {
+    e.preventDefault();
+    switchAuthMode('login');
+  });
+  elements.authForm.addEventListener('submit', handleAuthSubmit);
+  elements.btnLogout.addEventListener('click', handleLogOut);
+
+  // Form Submission
+  elements.customerForm.addEventListener('submit', handleCustomerSave);
+
+  // Search Input triggers
+  elements.searchInput.addEventListener('input', (e) => {
+    const value = e.target.value;
+    toggleClearSearchButton(value.length > 0);
+    filterCustomers(value);
+  });
+  elements.btnClearSearch.addEventListener('click', clearSearch);
+
+  // Map recenter button (High-accuracy geolocation)
+  elements.btnMyLocation.addEventListener('click', () => centerOnMyLocation(true));
+}
+
+/**
+ * Loads credentials from local storage and pre-fills the settings modal
+ */
+const defaultSupabaseUrl = 'https://syxfohkdzmfomxifuycs.supabase.co';
+const defaultSupabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN5eGZvaGtkem1mb214aWZ1eWNzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAzODY2MTEsImV4cCI6MjA5NTk2MjYxMX0.6H8OYYo4-kqnIkXlKwx4Lsdvk3PGcFfRplC2TSC1w44';
+
+function loadSavedSettings() {
+  let supabaseUrl = localStorage.getItem('supabase_url');
+  let supabaseKey = localStorage.getItem('supabase_key');
+  
+  if (!supabaseUrl) {
+    localStorage.setItem('supabase_url', defaultSupabaseUrl);
+    supabaseUrl = defaultSupabaseUrl;
+  }
+  if (!supabaseKey) {
+    localStorage.setItem('supabase_key', defaultSupabaseKey);
+    supabaseKey = defaultSupabaseKey;
+  }
+  
+  elements.supabaseUrlInput.value = supabaseUrl;
+  elements.supabaseKeyInput.value = supabaseKey;
+}
+
+/**
+ * Initializes the Leaflet map and tile grid immediately
+ */
+function initLeafletMap() {
+  const defaultCenter = [40.7128, -74.0060]; // New York fallback coordinates
+  
+  // Initialize Leaflet Map container
+  map = L.map(elements.mapViewport, {
+    zoomControl: false, // We'll add it in a customized touch-friendly position
+    attributionControl: true
+  }).setView(defaultCenter, 12);
+
+  // Add CartoDB Dark Matter tiles (highly premium dark mode mapping matching our CSS)
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    subdomains: 'abcd',
+    maxZoom: 20
+  }).addTo(map);
+
+  // Add touch-friendly zoom controls at the bottom-left
+  L.control.zoom({
+    position: 'bottomleft'
+  }).addTo(map);
+
+  // Map Tap/Click coordinate selector
+  map.on('click', (e) => {
+    const lat = e.latlng.lat;
+    const lng = e.latlng.lng;
+    setPickedLocation({ lat, lng });
+  });
+
+  // Center on GPS location automatically on load without toasts
+  centerOnMyLocation(false);
+}
+
+/**
+ * Checks for Supabase credentials and binds Supabase API library
+ */
+async function initializeDatabaseConnection() {
+  const supabaseUrl = localStorage.getItem('supabase_url');
+  const supabaseKey = localStorage.getItem('supabase_key');
+
+  if (!supabaseUrl || !supabaseKey) {
+    // Show database connection overlay prompt
+    elements.mapCredentialsOverlay.classList.remove('hidden');
+    elements.authOverlay.classList.add('hidden');
+    return;
+  }
+
+  elements.mapCredentialsOverlay.classList.add('hidden');
+
+  try {
+    // Dynamically inject Supabase UMD library if not loaded
+    if (!window.supabase) {
+      await loadExternalScript('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2');
+    }
+    
+    // Create Supabase Client instance
+    supabaseClient = window.supabase.createClient(supabaseUrl, supabaseKey);
+
+    // Listen for Authentication State changes
+    supabaseClient.auth.onAuthStateChange((event, session) => {
+      handleAuthStateChange(event, session);
+    });
+
+    // Check for Password Recovery URL hash tokens on load
+    checkPasswordRecovery();
+
+  } catch (err) {
+    console.error('Database connection error:', err);
+    showToast('Failed to load database client SDK. Check connectivity.', 'danger');
+  }
+}
+
+/**
+ * Scans the URL hash for recovery tokens, updating views immediately
+ */
+function checkPasswordRecovery() {
+  const hash = window.location.hash;
+  if (hash && (hash.includes('type=recovery') || hash.includes('recovery'))) {
+    showToast('Password recovery token detected. Please specify your new password.', 'info');
+    
+    // Open password reset panel
+    switchAuthMode('reset-password');
+    
+    // Clear hash parameters from URL bar to secure session token
+    window.history.replaceState(null, null, ' ');
+  }
+}
+
+/**
+ * Handler for Auth Session status changes
+ */
+async function handleAuthStateChange(event, session) {
+  // If recovery event happens, don't auto-redirect to login
+  if (event === 'PASSWORD_RECOVERY') {
+    showToast('Please type in your new password below.', 'info');
+    switchAuthMode('reset-password');
+    return;
+  }
+
+  if (session) {
+    // Check if email has been verified
+    const user = session.user;
+    if (!user.email_confirmed_at) {
+      // Force Sign Out to prevent dashboard entry, and remain on auth card
+      await supabaseClient.auth.signOut();
+      showToast('Login Failed: Your email address is not verified. Please click the verification link in your email.', 'danger');
+      return;
+    }
+
+    sessionUser = user;
+    
+    // Fetch worker name from user metadata or fallback to email prefix
+    userWorkerName = sessionUser.user_metadata?.worker_name || sessionUser.email.split('@')[0];
+    elements.inputWorker.value = userWorkerName;
+
+    // Show dashboard logs, display Log Out button, and hide authentication overlay
+    elements.authOverlay.classList.add('hidden');
+    elements.btnLogout.classList.remove('hidden');
+    
+    showToast(`Logged in as ${userWorkerName}`, 'success');
+
+    // Fetch this worker's scoped customer records
+    await fetchCustomers();
+
+  } else {
+    sessionUser = null;
+    userWorkerName = '';
+    elements.inputWorker.value = '';
+    
+    // Show authentication screen overlay (unless currently updating a password)
+    if (authMode !== 'reset-password') {
+      elements.authOverlay.classList.remove('hidden');
+      elements.btnLogout.classList.add('hidden');
+    }
+    
+    // Clear state caches
+    customersData = [];
+    elements.customerCount.innerText = '0';
+    elements.customerList.innerHTML = `
+      <div class="empty-state">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
+        <p>Please log in to view and save customer logs.</p>
+      </div>
+    `;
+
+    // Clear marker overlay arrays from Leaflet map
+    markers.forEach(m => m.marker.remove());
+    markers = [];
+    
+    if (userLocationMarker) {
+      userLocationMarker.remove();
+      userLocationMarker = null;
+    }
+  }
+}
+
+/**
+ * Helper to load scripts dynamically with promises
+ */
+function loadExternalScript(src) {
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src^="${src}"]`);
+    if (existing) {
+      resolve();
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.onload = resolve;
+    script.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.head.appendChild(script);
+  });
+}
+
+// ----------------------------------------------------
+// 2. Leaflet Geolocation & Mapping Logic
+// ----------------------------------------------------
+
+/**
+ * Centers map on current mobile GPS coordinates using high accuracy parameters.
+ * Automatically saves pinned position to coordinates form inputs.
+ */
+function centerOnMyLocation(triggerToast = true) {
+  if (!map) return;
+  
+  if (triggerToast) showToast('Requesting high-accuracy GPS coordinates...', 'info');
+
+  navigator.geolocation.getCurrentPosition(
+    (position) => {
+      const lat = position.coords.latitude;
+      const lng = position.coords.longitude;
+      const accuracy = position.coords.accuracy;
+
+      console.log(`GPS Location: ${lat}, ${lng} with accuracy ${accuracy}m`);
+
+      // Center map viewport and zoom to level 18 (street view)
+      map.setView([lat, lng], 18);
+
+      // Create or move glowing user position marker
+      if (userLocationMarker) {
+        userLocationMarker.setLatLng([lat, lng]);
+      } else {
+        const userIcon = L.divIcon({
+          className: 'custom-user-location-pin-container',
+          html: `<div class="custom-user-location-pin" title="Your current location"></div>`,
+          iconSize: [16, 16],
+          iconAnchor: [8, 8]
+        });
+        
+        userLocationMarker = L.marker([lat, lng], { icon: userIcon }).addTo(map);
+      }
+
+      // Automatically capture coordinates and prefill form coordinates card!
+      setPickedLocation({ lat, lng }, false);
+
+      if (triggerToast) {
+        showToast(`GPS position locked (accuracy: ${accuracy.toFixed(0)}m). Coords captured!`, 'success');
+      }
+    },
+    (error) => {
+      console.error('Geolocation API error:', error);
+      let errMsg = 'Failed to fetch GPS coordinates.';
+      
+      if (error.code === error.PERMISSION_DENIED) {
+        errMsg = 'GPS Permission Denied. Please enable location access in your browser settings.';
+      } else if (error.code === error.POSITION_UNAVAILABLE) {
+        errMsg = 'GPS coordinates are currently unavailable. Check location settings.';
+      } else if (error.code === error.TIMEOUT) {
+        errMsg = 'GPS locator timed out. Check your device GPS signal and try again.';
+      }
+      
+      showToast(errMsg, 'danger');
+    },
+    {
+      enableHighAccuracy: true,
+      timeout: 15000,
+      maximumAge: 0
+    }
+  );
+}
+
+/**
+ * Places/moves the temporary marker on coordinates selection
+ */
+function setPickedLocation(coords, panToCoords = true) {
+  selectedCoords = coords;
+
+  const latStr = coords.lat.toFixed(6);
+  const lngStr = coords.lng.toFixed(6);
+
+  // Update form texts and active styling
+  elements.valLatitude.innerText = latStr;
+  elements.valLongitude.innerText = lngStr;
+  elements.valLatitude.classList.remove('val-placeholder');
+  elements.valLongitude.classList.remove('val-placeholder');
+  elements.coordsCard.classList.add('active');
+
+  // Paint Temporary Leaflet divIcon marker
+  if (tempMarker) {
+    tempMarker.setLatLng([coords.lat, coords.lng]);
+  } else {
+    const tempIcon = L.divIcon({
+      className: 'custom-temp-marker-container',
+      html: `<div style="background-color: var(--color-secondary); width: 16px; height: 16px; border: 2.5px solid #ffffff; border-radius: 50%; box-shadow: 0 0 12px var(--color-secondary); animation: spin 2s linear infinite;"></div>`,
+      iconSize: [16, 16],
+      iconAnchor: [8, 8]
+    });
+    
+    tempMarker = L.marker([coords.lat, coords.lng], { icon: tempIcon }).addTo(map);
+  }
+
+  // Optionally pan to picked coordinates smoothly
+  if (panToCoords) {
+    map.panTo([coords.lat, coords.lng]);
+    showToast(`Captured coordinates: ${latStr}, ${lngStr}`, 'info');
+  }
+}
+
+/**
+ * Resets picked coordinates state and locator pin
+ */
+function clearTempMarker() {
+  if (tempMarker && map) {
+    tempMarker.remove();
+    tempMarker = null;
+  }
+  selectedCoords = null;
+  elements.valLatitude.innerText = 'Not Selected';
+  elements.valLongitude.innerText = 'Not Selected';
+  elements.valLatitude.classList.add('val-placeholder');
+  elements.valLongitude.classList.add('val-placeholder');
+  elements.coordsCard.classList.remove('active');
+}
+
+/**
+ * Repaints Leaflet Map Marker layers for saved database customers
+ */
+function refreshMapMarkers() {
+  if (!map) return;
+
+  // Clear current active markers
+  markers.forEach(m => m.marker.remove());
+  markers = [];
+
+  // Plot custom styled marker nodes
+  customersData.forEach(customer => {
+    const position = [customer.latitude, customer.longitude];
+
+    // Create a custom Leaflet divIcon representing the customer pin
+    const customerIcon = L.divIcon({
+      className: 'custom-customer-marker-container',
+      html: `<div class="customer-pin" data-id="${customer.id}" style="background-color: var(--color-primary); width: 14px; height: 14px; border: 2px solid white; border-radius: 50%; box-shadow: var(--shadow-glow); cursor: pointer;"></div>`,
+      iconSize: [14, 14],
+      iconAnchor: [7, 7]
+    });
+
+    const marker = L.marker(position, { icon: customerIcon }).addTo(map);
+
+    // Popup InfoWindow Content Formulator (Leaflet)
+    const popupHTML = `
+      <div class="map-popup-body" style="color: var(--text-primary); font-family: 'Outfit', sans-serif;">
+        <h4 style="margin: 0 0 4px 0; font-size: 13px; font-weight: 700; color: #ffffff;">${escapeHtml(customer.name)}</h4>
+        <p style="margin: 0 0 4px 0; font-size: 11px; color: var(--text-secondary);">
+          <strong>Phone:</strong> ${escapeHtml(customer.phone)}
+        </p>
+        <p style="margin: 0 0 8px 0; font-size: 11px; color: var(--color-secondary);">
+          <strong>Worker:</strong> ${escapeHtml(customer.worker_name)}
+        </p>
+        ${customer.notes ? `<p style="margin: 0 0 10px 0; font-size: 11px; background: rgba(255,255,255,0.04); border: 1.5px solid var(--border-color); padding: 6px; border-radius: var(--radius-sm); color: var(--text-secondary); max-height: 80px; overflow-y: auto;">${escapeHtml(customer.notes)}</p>` : ''}
+        <div style="display: flex; width: 100%;">
+          <a href="https://www.google.com/maps/dir/?api=1&destination=${customer.latitude},${customer.longitude}" 
+             target="_blank" 
+             style="background: var(--color-success); color: white; border: none; padding: 6px 10px; font-size: 11px; border-radius: var(--radius-sm); text-decoration: none; font-weight: bold; text-align: center; display: block; flex: 1;">
+             Navigate
+          </a>
+        </div>
+      </div>
+    `;
+
+    marker.bindPopup(popupHTML, {
+      closeButton: true,
+      minWidth: 180
+    });
+
+    // Handle marker tap
+    marker.on('click', () => {
+      map.panTo(position);
+      
+      // Auto-toggle tab drawer and focus customer card
+      switchTab('database');
+      highlightCustomerCard(customer.id);
+    });
+
+    markers.push({ id: customer.id, marker });
+  });
+}
+
+/**
+ * Smooth pans Leaflet viewport to customer and opens its popup content
+ */
+function locateCustomerOnMap(customer) {
+  if (!map) return;
+
+  const position = [customer.latitude, customer.longitude];
+  map.panTo(position);
+  
+  const markerObj = markers.find(m => m.id === customer.id);
+  if (markerObj) {
+    markerObj.marker.openPopup();
+    
+    // Animate pin element briefly (using CSS custom bouncy active styles)
+    const el = markerObj.marker.getElement();
+    if (el) {
+      el.classList.add('highlighted-marker');
+      setTimeout(() => {
+        el.classList.remove('highlighted-marker');
+      }, 3000);
+    }
+  }
+}
+
+// ----------------------------------------------------
+// 3. Database Integrations (Supabase Scoped CRUD)
+// ----------------------------------------------------
+
+/**
+ * Syncs saved customer records scoped to current worker user
+ */
+async function fetchCustomers() {
+  if (!supabaseClient || !sessionUser) return;
+
+  try {
+    // Supabase will filter automatically via RLS if enabled.
+    // We add an explicit filter to match worker_id as a layer of database safety.
+    const { data, error } = await supabaseClient
+      .from('customer')
+      .select('*')
+      .eq('worker_id', sessionUser.id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    customersData = data || [];
+
+    // Update Sidepanel Tab Badge Count
+    elements.customerCount.innerText = customersData.length;
+
+    // Render Cards List UI
+    renderCustomerList(customersData);
+
+    // Refresh Leaflet Pins
+    refreshMapMarkers();
+
+  } catch (err) {
+    console.error('Database fetch error:', err);
+    showToast('Failed to sync customer list with Supabase.', 'danger');
+  }
+}
+
+/**
+ * Inserts new customer logging coordinates into Supabase table
+ */
+async function handleCustomerSave(e) {
+  e.preventDefault();
+
+  if (!supabaseClient || !sessionUser) {
+    showToast('You must be logged in to save customer records.', 'warning');
+    return;
+  }
+
+  if (!selectedCoords) {
+    showToast('Please select coordinates by tapping the map or clicking My Location.', 'warning');
+    elements.coordsCard.style.borderColor = 'var(--color-danger)';
+    setTimeout(() => {
+      elements.coordsCard.style.borderColor = '';
+    }, 1000);
+    return;
+  }
+
+  const name = elements.inputName.value.trim();
+  const workerName = elements.inputWorker.value.trim();
+  const phone = elements.inputPhone.value.trim();
+  const notes = elements.inputNotes.value.trim();
+
+  if (!name || !workerName || !phone) {
+    showToast('Customer Name, Worker Name, and Phone Number are required.', 'warning');
+    return;
+  }
+
+  setSaveButtonLoading(true);
+
+  try {
+    const { error } = await supabaseClient
+      .from('customer')
+      .insert([
+        {
+          name,
+          worker_name: workerName,
+          phone,
+          latitude: selectedCoords.lat,
+          longitude: selectedCoords.lng,
+          notes: notes || null,
+          worker_id: sessionUser.id // Row Level Security scope key
+        }
+      ]);
+
+    if (error) throw error;
+
+    showToast('Customer record saved successfully!', 'success');
+    
+    // Clear forms and temporary picked markers (but keep Worker Name populated!)
+    elements.customerForm.reset();
+    elements.inputWorker.value = userWorkerName;
+    clearTempMarker();
+
+    // Re-sync database
+    await fetchCustomers();
+
+    // Auto navigate user to Database Tab list
+    switchTab('database');
+
+  } catch (err) {
+    console.error('Insert query error:', err);
+    showToast(`Failed to save: ${err.message || err}`, 'danger');
+  } finally {
+    setSaveButtonLoading(false);
+  }
+}
+
+/**
+ * Removes customer record matching ID from Supabase table
+ */
+async function deleteCustomer(id, name) {
+  if (!supabaseClient || !sessionUser) return;
+
+  const confirmMsg = `Are you sure you want to delete the record for "${name}"?`;
+  if (!confirm(confirmMsg)) return;
+
+  showToast('Deleting record...', 'info');
+
+  try {
+    const { error } = await supabaseClient
+      .from('customer')
+      .delete()
+      .eq('id', id)
+      .eq('worker_id', sessionUser.id); // Guard check
+
+    if (error) throw error;
+
+    showToast(`Record for "${name}" deleted.`, 'success');
+    
+    // Re-sync database to refresh lists and map markers
+    await fetchCustomers();
+
+  } catch (err) {
+    console.error('Delete query error:', err);
+    showToast('Could not delete customer record.', 'danger');
+  }
+}
+
+// ----------------------------------------------------
+// 4. Supabase Authentication Handlers
+// ----------------------------------------------------
+
+/**
+ * Switches the visual tab of the authentication panel
+ */
+function switchAuthMode(mode) {
+  authMode = mode;
+  
+  // Clear any inputs
+  elements.authEmail.value = '';
+  elements.authPassword.value = '';
+  elements.authWorkerName.value = '';
+  if (elements.authConfirmPassword) elements.authConfirmPassword.value = '';
+
+  // Reset required attributes
+  elements.authEmail.required = false;
+  elements.authPassword.required = false;
+  elements.authWorkerName.required = false;
+  elements.authConfirmPassword.required = false;
+
+  // Render elements based on chosen state
+  if (mode === 'login') {
+    elements.authNavTabs.classList.remove('hidden');
+    elements.authTabLogin.classList.add('active');
+    elements.authTabSignup.classList.remove('active');
+    elements.authGroupEmail.classList.remove('hidden');
+    elements.authGroupPassword.classList.remove('hidden');
+    elements.authGroupWorkerName.classList.add('hidden');
+    elements.authGroupConfirmPassword.classList.add('hidden');
+    elements.authForgotPasswordLink.classList.remove('hidden');
+    elements.authFooter.classList.add('hidden');
+    
+    elements.authPasswordLabel.innerText = 'Password';
+    elements.authEmail.required = true;
+    elements.authPassword.required = true;
+    elements.btnAuthSubmit.querySelector('.btn-text').innerText = 'Sign In';
+
+  } else if (mode === 'signup') {
+    elements.authNavTabs.classList.remove('hidden');
+    elements.authTabSignup.classList.add('active');
+    elements.authTabLogin.classList.remove('active');
+    elements.authGroupEmail.classList.remove('hidden');
+    elements.authGroupPassword.classList.remove('hidden');
+    elements.authGroupWorkerName.classList.remove('hidden');
+    elements.authGroupConfirmPassword.classList.add('hidden');
+    elements.authForgotPasswordLink.classList.add('hidden');
+    elements.authFooter.classList.add('hidden');
+    
+    elements.authPasswordLabel.innerText = 'Password';
+    elements.authEmail.required = true;
+    elements.authPassword.required = true;
+    elements.authWorkerName.required = true;
+    elements.btnAuthSubmit.querySelector('.btn-text').innerText = 'Create Account';
+
+  } else if (mode === 'forgot-password') {
+    elements.authNavTabs.classList.add('hidden');
+    elements.authGroupEmail.classList.remove('hidden');
+    elements.authGroupPassword.classList.add('hidden');
+    elements.authGroupWorkerName.classList.add('hidden');
+    elements.authGroupConfirmPassword.classList.add('hidden');
+    elements.authFooter.classList.remove('hidden');
+    
+    elements.authEmail.required = true;
+    elements.btnAuthSubmit.querySelector('.btn-text').innerText = 'Send Reset Link';
+
+  } else if (mode === 'reset-password') {
+    elements.authOverlay.classList.remove('hidden'); // Force overlay display
+    elements.authNavTabs.classList.add('hidden');
+    elements.authGroupEmail.classList.add('hidden');
+    elements.authGroupPassword.classList.remove('hidden');
+    elements.authGroupWorkerName.classList.add('hidden');
+    elements.authGroupConfirmPassword.classList.remove('hidden');
+    elements.authForgotPasswordLink.classList.add('hidden');
+    elements.authFooter.classList.add('hidden');
+    
+    elements.authPasswordLabel.innerText = 'New Password';
+    elements.authPassword.required = true;
+    elements.authConfirmPassword.required = true;
+    elements.btnAuthSubmit.querySelector('.btn-text').innerText = 'Update Password';
+  }
+}
+
+/**
+ * Submits Auth inputs to Supabase Auth API based on active screen mode
+ */
+async function handleAuthSubmit(e) {
+  e.preventDefault();
+
+  if (!supabaseClient) {
+    showToast('Database not configured. Please open settings.', 'warning');
+    return;
+  }
+
+  const email = elements.authEmail.value.trim();
+  const password = elements.authPassword.value.trim();
+  const workerName = elements.authWorkerName.value.trim();
+  const confirmPassword = elements.authConfirmPassword ? elements.authConfirmPassword.value.trim() : '';
+
+  setAuthButtonLoading(true);
+
+  try {
+    if (authMode === 'login') {
+      // Log In process
+      const { data, error } = await supabaseClient.auth.signInWithPassword({
+        email,
+        password
+      });
+
+      if (error) throw error;
+      
+    } else if (authMode === 'signup') {
+      // Register (Sign Up) process
+      const { data, error } = await supabaseClient.auth.signUp({
+        email,
+        password,
+        options: {
+          data: {
+            worker_name: workerName
+          }
+        }
+      });
+
+      if (error) throw error;
+      
+      // Notify check inbox
+      showToast('Registration successful! A verification email has been sent. Please confirm your email before logging in.', 'success');
+      switchAuthMode('login');
+
+    } else if (authMode === 'forgot-password') {
+      // Forgot Password trigger
+      const { error } = await supabaseClient.auth.resetPasswordForEmail(email, {
+        redirectTo: 'https://manukumarm1020-source.github.io/field-worker-map-tracker/'
+      });
+
+      if (error) throw error;
+
+      showToast('Password reset link sent! Check your inbox for recovery credentials.', 'success');
+      switchAuthMode('login');
+
+    } else if (authMode === 'reset-password') {
+      // Password Reset replacement validation
+      if (password !== confirmPassword) {
+        showToast('Passwords do not match.', 'warning');
+        setAuthButtonLoading(false);
+        return;
+      }
+
+      if (password.length < 6) {
+        showToast('Password should be at least 6 characters.', 'warning');
+        setAuthButtonLoading(false);
+        return;
+      }
+
+      const { error } = await supabaseClient.auth.updateUser({
+        password: password
+      });
+
+      if (error) throw error;
+
+      showToast('Password updated successfully. You can now sign in.', 'success');
+      switchAuthMode('login');
+    }
+
+  } catch (err) {
+    console.error('Authentication API error:', err);
+    showToast(`Authentication Failed: ${err.message || err}`, 'danger');
+  } finally {
+    setAuthButtonLoading(false);
+  }
+}
+
+/**
+ * Handles Session Termination
+ */
+async function handleLogOut() {
+  if (!supabaseClient) return;
+
+  if (!confirm('Are you sure you want to log out of your account?')) {
+    return;
+  }
+
+  try {
+    const { error } = await supabaseClient.auth.signOut();
+    if (error) throw error;
+    showToast('Logged out successfully.', 'info');
+    switchAuthMode('login');
+  } catch (err) {
+    console.error('Logout error:', err);
+    showToast('Failed to log out correctly.', 'danger');
+  }
+}
+
+// ----------------------------------------------------
+// 5. Settings Modal Controls
+// ----------------------------------------------------
+
+function openSettingsModal() {
+  elements.settingsModal.classList.add('active');
+}
+
+function closeSettingsModal() {
+  elements.settingsModal.classList.remove('active');
+}
+
+/**
+ * Persists DB credentials, closes modal and re-initializes sync actions
+ */
+function handleSettingsSave(e) {
+  e.preventDefault();
+
+  const supabaseUrl = elements.supabaseUrlInput.value.trim();
+  const supabaseKey = elements.supabaseKeyInput.value.trim();
+
+  localStorage.setItem('supabase_url', supabaseUrl);
+  localStorage.setItem('supabase_key', supabaseKey);
+
+  showToast('Settings saved. Refreshing database sync...', 'success');
+  closeSettingsModal();
+
+  setTimeout(() => {
+    window.location.reload();
+  }, 1000);
+}
+
+/**
+ * Clears database credentials from browser storage
+ */
+function handleSettingsClear() {
+  if (!confirm('Are you sure you want to clear your credentials? This will disconnect the app from the database.')) {
+    return;
+  }
+
+  localStorage.removeItem('supabase_url');
+  localStorage.removeItem('supabase_key');
+
+  elements.supabaseUrlInput.value = '';
+  elements.supabaseKeyInput.value = '';
+
+  showToast('Database credentials cleared.', 'warning');
+  closeSettingsModal();
+
+  setTimeout(() => {
+    window.location.reload();
+  }, 1000);
+}
+
+// ----------------------------------------------------
+// 6. UI Actions, Filters & Toast Helpers
+// ----------------------------------------------------
+
+function toggleClearSearchButton(show) {
+  if (show) {
+    elements.btnClearSearch.classList.remove('hidden');
+  } else {
+    elements.btnClearSearch.classList.add('hidden');
+  }
+}
+
+function clearSearch() {
+  elements.searchInput.value = '';
+  toggleClearSearchButton(false);
+  filterCustomers('');
+}
+
+function setSaveButtonLoading(isLoading) {
+  const btnText = elements.btnSave.querySelector('.btn-text');
+  const spinner = elements.btnSave.querySelector('.spinner');
+
+  if (isLoading) {
+    elements.btnSave.disabled = true;
+    btnText.style.opacity = '0.3';
+    spinner.classList.remove('hidden');
+  } else {
+    elements.btnSave.disabled = false;
+    btnText.style.opacity = '1';
+    spinner.classList.add('hidden');
+  }
+}
+
+function setAuthButtonLoading(isLoading) {
+  const btnText = elements.btnAuthSubmit.querySelector('.btn-text');
+  const spinner = elements.btnAuthSubmit.querySelector('.spinner');
+
+  if (isLoading) {
+    elements.btnAuthSubmit.disabled = true;
+    btnText.style.opacity = '0.3';
+    spinner.classList.remove('hidden');
+  } else {
+    elements.btnAuthSubmit.disabled = false;
+    btnText.style.opacity = '1';
+    spinner.classList.add('hidden');
+  }
+}
+
+/**
+ * Builds HTML card listings and binds event listeners
+ */
+function renderCustomerList(list) {
+  elements.customerList.innerHTML = '';
+
+  if (list.length === 0) {
+    elements.customerList.innerHTML = `
+      <div class="empty-state">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+        <p>No customer records found matching search filters.</p>
+      </div>
+    `;
+    return;
+  }
+
+  list.forEach(customer => {
+    const card = document.createElement('div');
+    card.className = 'customer-card';
+    card.id = `customer-card-${customer.id}`;
+
+    const navigateUrl = `https://www.google.com/maps/dir/?api=1&destination=${customer.latitude},${customer.longitude}`;
+
+    card.innerHTML = `
+      <div class="card-header">
+        <div class="card-title">
+          <h3>${escapeHtml(customer.name)}</h3>
+          <p>
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path></svg>
+            <span>${escapeHtml(customer.phone)}</span>
+          </p>
+        </div>
+      </div>
+      
+      <div class="card-body">
+        <p style="margin-bottom: 6px; font-size: 0.8rem; color: var(--color-secondary);">
+          <strong>Worker:</strong> ${escapeHtml(customer.worker_name)}
+        </p>
+        ${customer.notes ? `<p style="margin-bottom: 8px;">${escapeHtml(customer.notes)}</p>` : '<p style="font-style: italic; color: var(--text-muted); margin-bottom: 8px;">No notes.</p>'}
+        <div class="card-coords">
+          <span>Lat: ${customer.latitude.toFixed(5)}</span>
+          <span>Lng: ${customer.longitude.toFixed(5)}</span>
+        </div>
+      </div>
+
+      <div class="card-actions">
+        <a href="${navigateUrl}" target="_blank" class="btn btn-navigate" title="Launch navigation overlay">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px; height:16px;"><polygon points="3 11 22 2 13 21 11 13 3 11"></polygon></svg>
+          <span>Navigate</span>
+        </a>
+        <button class="btn btn-delete" data-id="${customer.id}" data-name="${customer.name}">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px; height:16px;"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+          <span>Delete</span>
+        </button>
+      </div>
+    `;
+
+    // Bind Delete Button action
+    card.querySelector('.btn-delete').addEventListener('click', (e) => {
+      const btn = e.currentTarget;
+      deleteCustomer(Number(btn.dataset.id), btn.dataset.name);
+    });
+
+    // Bind card body action to locate customer marker on Leaflet map
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('.btn-delete') || e.target.closest('.btn-navigate')) {
+        return;
+      }
+      locateCustomerOnMap(customer);
+    });
+
+    elements.customerList.appendChild(card);
+  });
+}
+
+/**
+ * Filter customer listings and Leaflet markers matching search terms
+ */
+function filterCustomers(query) {
+  const cleanQuery = query.toLowerCase().trim();
+
+  // Filter lists
+  const filtered = customersData.filter(customer => {
+    return customer.name.toLowerCase().includes(cleanQuery) ||
+           customer.phone.toLowerCase().includes(cleanQuery) ||
+           (customer.worker_name && customer.worker_name.toLowerCase().includes(cleanQuery)) ||
+           (customer.notes && customer.notes.toLowerCase().includes(cleanQuery));
+  });
+
+  // Re-render
+  renderCustomerList(filtered);
+
+  // Sync Leaflet markers visible layers dynamically
+  markers.forEach(markerObj => {
+    const isMatched = filtered.some(f => f.id === markerObj.id);
+    if (isMatched) {
+      markerObj.marker.addTo(map);
+    } else {
+      markerObj.marker.remove();
+    }
+  });
+}
+
+/**
+ * Highlights a customer card and scrolls database container down to center it
+ */
+function highlightCustomerCard(id) {
+  document.querySelectorAll('.customer-card').forEach(el => el.classList.remove('highlighted'));
+
+  const card = document.getElementById(`customer-card-${id}`);
+  if (card) {
+    card.classList.add('highlighted');
+    
+    // Quick inline styling for highlights dynamically
+    card.style.borderColor = 'var(--color-primary)';
+    card.style.boxShadow = 'var(--shadow-glow)';
+    setTimeout(() => {
+      card.style.borderColor = '';
+      card.style.boxShadow = '';
+    }, 2500);
+
+    card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+}
+
+/**
+ * Handles tab navigation panel swaps
+ */
+function switchTab(tab) {
+  if (tab === 'log') {
+    elements.tabLog.classList.add('active');
+    elements.tabDatabase.classList.remove('active');
+    elements.panelForm.classList.add('active');
+    elements.panelDatabase.classList.remove('active');
+  } else {
+    elements.tabDatabase.classList.add('active');
+    elements.tabLog.classList.remove('active');
+    elements.panelDatabase.classList.add('active');
+    elements.panelForm.classList.remove('active');
+  }
+}
+
+/**
+ * Renders modern toast banners
+ */
+function showToast(message, type = 'info') {
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  
+  toast.innerHTML = `
+    <span>${escapeHtml(message)}</span>
+    <button class="toast-close">&times;</button>
+  `;
+
+  toast.querySelector('.toast-close').addEventListener('click', () => {
+    toast.style.opacity = '0';
+    toast.style.transform = 'translateY(10px)';
+    setTimeout(() => toast.remove(), 250);
+  });
+
+  elements.toastContainer.appendChild(toast);
+
+  setTimeout(() => {
+    if (toast.parentNode) {
+      toast.style.opacity = '0';
+      toast.style.transform = 'translateY(10px)';
+      setTimeout(() => toast.remove(), 250);
+    }
+  }, 5000);
+}
+
+/**
+ * Escapes characters to guard against simple XSS vectors
+ */
+function escapeHtml(str) {
+  if (!str) return '';
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
